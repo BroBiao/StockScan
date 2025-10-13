@@ -118,10 +118,10 @@ def main():
         scanner.scan_stocks()
 
         scanner.save_results()
-        print('扫描并保存完毕！')
+        logger.info('扫描并保存完毕！')
 
         scanner.send_results()
-        print('结果发送成功！')
+        logger.info('结果发送成功！')
         
     except KeyboardInterrupt:
         logger.info("用户中断了扫描")
