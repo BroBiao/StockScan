@@ -16,6 +16,7 @@ class StockScanner:
     def __init__(self, delay=1):
         self.delay = delay
         self.results = []
+        self.dir_path = os.path.dirname(os.path.abspath(__file__))
         
     def calculate_ema(self, prices, period):
         return prices.ewm(span=period, adjust=False).mean()
@@ -59,7 +60,8 @@ class StockScanner:
         logger.info("开始扫描股票...")
         
         # 获取股票列表
-        with open('final_tickers.json', 'r') as f:
+        ticker_path = os.path.join(self.dir_path, 'final_tickers.json')
+        with open(ticker_path, 'r') as f:
             symbols = json.load(f)
         
         logger.info(f"准备分析 {len(symbols)} 只股票")
@@ -78,21 +80,36 @@ class StockScanner:
         logger.info(f"扫描完成，共分析了 {len(self.results)} 只股票")
     
     def save_results(self):
-        filename = 'full_scan_result.json'
-        if os.path.isfile(filename):
-            with open(filename, 'r') as f:
+        full_path = os.path.join(self.dir_path, 'full_scan_result.json')
+        if os.path.isfile(full_path):
+            with open(full_path, 'r') as f:
                 old_results = json.load(f)
         else:
             old_results = []
-        with open(filename, 'w') as f:
+        with open(full_path, 'w') as f:
             json.dump(self.results, f)
-        logger.info(f"完整结果已保存到 {filename}")
+        logger.info(f"完整结果已保存到 {full_path}")
         
-        filename = 'delta_scan_result.json'
+        delta_path = os.path.join(self.dir_path, 'delta_scan_result.json')
         delta_results = list(set(self.results) - set(old_results))
-        with open(filename, 'w') as f:
+        with open(delta_path, 'w') as f:
             json.dump(delta_results, f)
-        logger.info(f'今日新增结果已保存到 {filename}')
+        logger.info(f'今日新增结果已保存到 {delta_path}')
+
+    def send_results(self):
+        import asyncio
+        import telegram
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        bot_token = os.getenv('BOT_TOKEN')
+        chat_id = os.getenv('CHAT_ID')
+        bot = telegram.Bot(bot_token)
+
+        delta_path = os.path.join(self.dir_path, 'delta_scan_result.json')
+        with open(delta_path, 'r') as f:
+            result = str(json.load(f))
+        asyncio.run(bot.send_message(chat_id=chat_id, text=result))
 
 def main():
     scanner = StockScanner(delay=1)
@@ -100,8 +117,11 @@ def main():
     try:
         scanner.scan_stocks()
 
-        filename = scanner.save_results()
+        scanner.save_results()
         print('扫描并保存完毕！')
+
+        scanner.send_results()
+        print('结果发送成功！')
         
     except KeyboardInterrupt:
         logger.info("用户中断了扫描")
