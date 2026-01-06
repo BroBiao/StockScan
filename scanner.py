@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class StockScanner:
     def __init__(self, delay=1):
         self.delay = delay
+        self.excluded_sectors = ['financial-services', 'real-estate']
         self.results = []
         self.dir_path = os.path.dirname(os.path.abspath(__file__))
         
@@ -28,6 +29,10 @@ class StockScanner:
             
             if hist.empty or len(hist) < 120:
                 logger.warning(f"{symbol}: 数据不足")
+                return None
+
+            if stock.info['sectorKey'] in self.excluded_sectors:
+                logger.warning(f"{symbol}所属行业{stock.info['sector']}已被排除")
                 return None
             
             # 计算EMA
