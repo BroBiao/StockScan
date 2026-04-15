@@ -6,22 +6,34 @@ import logging
 import os
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yfinance as yf
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
 import us_ticker_filter
+
+load_dotenv()
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Finnhub K线接口
+CANDLE_URL = "https://finnhub.io/api/v1/stock/candle"
+
+# Finnhub 免费版限速：60次/分钟，间隔 1.1 秒可安全运行
+CANDLE_REQUEST_INTERVAL_SECONDS = 1.1
+CANDLE_RETRIES = 3
+CANDLE_RETRY_WAIT_SECONDS = 15  # 遇到 429 时的等待时长
+RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
 # 策略配置中心
 SCAN_CONFIG = {
-    "BATCH_SIZE": 100,
-    "EXCLUDED_SECTORS": ["financial-services", "real-estate", "Financial Services", "Real Estate"],
+    "EXCLUDED_SECTORS": ["Real Estate"],
     "VOLATILITY": {
         "WINDOW": 60,  # 检查过去 60 个交易日
         "THRESHOLD": 1.2,  # 最高价/最低价必须 > 1.2
@@ -55,6 +67,92 @@ def _atomic_write_json(path: Path, data) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def _is_retryable_status(status: int) -> bool:
+    return status in RETRYABLE_STATUS_CODES or 500 <= status < 600
+
+
+def _fetch_candle(api_key: str, symbol: str, days: int = 365) -> Optional[pd.DataFrame]:
+    """
+    从 Finnhub 拉取指定股票的日线 K 线数据，返回包含 Close/High/Low 列的 DataFrame。
+    失败或数据不足时返回 None。
+
+    Finnhub candle API 文档:
+      GET /stock/candle?symbol=<sym>&resolution=D&from=<unix>&to=<unix>&token=<key>
+    响应字段: c(收盘), h(最高), l(最低), o(开盘), v(成交量), t(时间戳), s(状态)
+    """
+    to_ts = int(datetime.now().timestamp())
+    from_ts = int((datetime.now() - timedelta(days=days)).timestamp())
+
+    params = {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": str(from_ts),
+        "to": str(to_ts),
+        "token": api_key,
+    }
+
+    for attempt in range(1, CANDLE_RETRIES + 1):
+        try:
+            response = requests.get(CANDLE_URL, params=params, timeout=20)
+        except requests.RequestException as e:
+            logger.warning(f"{symbol} 请求失败 (第 {attempt}/{CANDLE_RETRIES} 次): {e}")
+            if attempt < CANDLE_RETRIES:
+                time.sleep(CANDLE_RETRY_WAIT_SECONDS * attempt)
+            continue
+
+        status = response.status_code
+
+        if status == 429:
+            wait = CANDLE_RETRY_WAIT_SECONDS * attempt
+            logger.warning(f"{symbol} 触发 429 限速，等待 {wait} 秒后重试...")
+            if attempt < CANDLE_RETRIES:
+                time.sleep(wait)
+            continue
+
+        if _is_retryable_status(status):
+            wait = CANDLE_RETRY_WAIT_SECONDS * attempt
+            logger.warning(f"{symbol} HTTP {status} 临时错误，等待 {wait} 秒后重试...")
+            if attempt < CANDLE_RETRIES:
+                time.sleep(wait)
+            continue
+
+        if status != 200:
+            logger.debug(f"{symbol} HTTP {status}，跳过。")
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning(f"{symbol} 响应不是合法 JSON，跳过。")
+            return None
+
+        # Finnhub 在无数据时返回 {"s": "no_data"}
+        if not isinstance(payload, dict) or payload.get("s") != "ok":
+            logger.debug(f"{symbol} Finnhub 返回 s={payload.get('s', '?')}，跳过。")
+            return None
+
+        c = payload.get("c")
+        h = payload.get("h")
+        l = payload.get("l")
+        t = payload.get("t")
+
+        if not (c and h and l and t and len(c) == len(h) == len(l) == len(t)):
+            logger.debug(f"{symbol} K线数组长度不一致或为空，跳过。")
+            return None
+
+        df = pd.DataFrame({
+            "Close": c,
+            "High":  h,
+            "Low":   l,
+        }, index=pd.to_datetime(t, unit="s", utc=True))
+        df.index.name = "Date"
+        df.sort_index(inplace=True)
+
+        return df
+
+    return None
+
+
 class StockScanner:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or SCAN_CONFIG
@@ -65,6 +163,10 @@ class StockScanner:
             value.lower().replace(" ", "-") for value in self.config["EXCLUDED_SECTORS"]
         }
         self.excluded_sector_names = {value.lower() for value in self.config["EXCLUDED_SECTORS"]}
+
+        self.api_key = os.getenv("FINNHUB_API_KEY")
+        if not self.api_key:
+            raise ValueError("FINNHUB_API_KEY is required in .env")
 
     def calculate_ema(self, prices, period):
         return prices.ewm(span=period, adjust=False).mean()
@@ -131,45 +233,6 @@ class StockScanner:
 
         return sorted(set(symbols))
 
-    @staticmethod
-    def extract_symbol_history(data, symbol: str):
-        if data is None or data.empty:
-            return None
-
-        if getattr(data.columns, "nlevels", 1) > 1:
-            top_level = set(data.columns.get_level_values(0))
-            if symbol not in top_level:
-                return None
-            hist = data[symbol]
-        else:
-            hist = data
-
-        required_cols = ["Close", "High", "Low"]
-        if any(col not in hist.columns for col in required_cols):
-            return None
-
-        hist = hist.dropna(subset=required_cols)
-        if hist.empty:
-            return None
-
-        return hist
-
-    def fetch_single_symbol_history(self, symbol: str):
-        """批量结果缺失时，回退到单票下载，避免静默漏扫。"""
-        try:
-            data = yf.download(
-                symbol,
-                period="1y",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
-            return self.extract_symbol_history(data, symbol)
-        except Exception as e:
-            logger.debug(f"{symbol} 单票补拉失败: {e}")
-            return None
-
     def scan_stocks(self):
         logger.info("开始扫描股票...")
         symbols = self.load_symbols()
@@ -179,50 +242,38 @@ class StockScanner:
             logger.warning("股票池为空，停止扫描。")
             return
 
-        batch_size = self.config["BATCH_SIZE"]
         min_required = self.config["EMA"]["LONG"]
+        total = len(symbols)
 
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i : i + batch_size]
-            logger.info(f"正在下载第 {i // batch_size + 1} 批数据...")
-
+        for idx, symbol in enumerate(symbols, start=1):
             try:
-                data = yf.download(
-                    batch_symbols,
-                    period="1y",
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    progress=False,
-                    threads=True,
-                )
+                hist = _fetch_candle(self.api_key, symbol)
+
+                if hist is None or len(hist) < min_required:
+                    logger.debug(f"[{idx}/{total}] {symbol} 数据不足，跳过。")
+                    time.sleep(CANDLE_REQUEST_INTERVAL_SECONDS)
+                    continue
+
+                if not self.is_volatile_enough(hist):
+                    time.sleep(CANDLE_REQUEST_INTERVAL_SECONDS)
+                    continue
+
+                is_trend, emas = self.check_ema_trend(hist["Close"])
+                if not is_trend:
+                    time.sleep(CANDLE_REQUEST_INTERVAL_SECONDS)
+                    continue
+
+                if self.check_pullback(hist, emas):
+                    logger.info(f"[{idx}/{total}] ✓ {symbol}: 符合所有条件")
+                    self.results.append(symbol)
+                else:
+                    logger.debug(f"[{idx}/{total}] {symbol} 未满足回踩条件，跳过。")
+
             except Exception as e:
-                logger.error(f"批量下载失败: {e}")
-                time.sleep(2)
-                continue
+                logger.debug(f"[{idx}/{total}] 分析 {symbol} 内部跳过: {e}")
 
-            for symbol in batch_symbols:
-                try:
-                    hist = self.extract_symbol_history(data, symbol)
-                    if hist is None:
-                        hist = self.fetch_single_symbol_history(symbol)
-                    if hist is None or len(hist) < min_required:
-                        continue
-
-                    if not self.is_volatile_enough(hist):
-                        continue
-
-                    is_trend, emas = self.check_ema_trend(hist["Close"])
-                    if not is_trend:
-                        continue
-
-                    if self.check_pullback(hist, emas):
-                        logger.info(f"✓ {symbol}: 符合所有条件")
-                        self.results.append(symbol)
-                except Exception as e:
-                    logger.debug(f"分析 {symbol} 内部跳过: {e}")
-
-            time.sleep(2)
+            # 无论成功与否均保持限速间隔，确保不超过 60次/分钟
+            time.sleep(CANDLE_REQUEST_INTERVAL_SECONDS)
 
         self.results = sorted(set(self.results))
         logger.info(f"扫描完成，共找到 {len(self.results)} 只股票")
@@ -251,9 +302,7 @@ class StockScanner:
     def send_results(self):
         import asyncio
         import telegram
-        from dotenv import load_dotenv
 
-        load_dotenv()
         bot_token = os.getenv("BOT_TOKEN")
         chat_id = os.getenv("CHAT_ID")
         if not bot_token or not chat_id:
@@ -290,7 +339,6 @@ def check_and_update_tickers(base_dir: Path):
 
     if need_update:
         try:
-            # 可能持续较长时间，取决于全市场股票数量和 API 额度
             us_ticker_filter.main(output_path=str(ticker_path))
             logger.info("股票池更新完成！")
         except Exception as e:
