@@ -428,7 +428,7 @@ class StockScanner:
             raise ValueError("delta_scan_result.json must contain a list.")
 
         if delta_results:
-            message = "New signals today:\n" + "\n".join(str(symbol) for symbol in delta_results)
+            message = str(delta_results)
         else:
             message = "No new signals today."
 
