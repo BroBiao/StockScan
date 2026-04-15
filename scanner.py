@@ -161,7 +161,7 @@ class StockScanner:
                 symbol,
                 period="1y",
                 interval="1d",
-                auto_adjust=False,
+                auto_adjust=True,
                 progress=False,
                 threads=False,
             )
@@ -192,7 +192,7 @@ class StockScanner:
                     period="1y",
                     interval="1d",
                     group_by="ticker",
-                    auto_adjust=False,
+                    auto_adjust=True,
                     progress=False,
                     threads=True,
                 )
