@@ -1,12 +1,16 @@
+import csv
+import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,67 +22,29 @@ logger = logging.getLogger(__name__)
 # 筛选配置
 FILTER_CONFIG = {
     "MARKET_CAP_THRESHOLD": 1_000_000_000,  # 1B
-    "EXCLUDED_SECTORS": ["Financial Services", "Real Estate"],  # Finnhub 行业名称
-    "API_URL": "https://finnhub.io/api/v1/stock/symbol",
-    "PROFILE_URL": "https://finnhub.io/api/v1/stock/profile2",
-    "ALLOWED_MIC": {"XNYS", "XNAS", "ARCX"},
+    "EXCLUDED_SECTORS": ["real-estate"],
+    "NASDAQ_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+    "OTHER_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+    "ALLOWED_OTHERLISTED_EXCHANGES": {"N", "A", "P"},
 }
 
 REQUEST_TIMEOUT = 20
 LIST_RETRIES = 3
-PROFILE_RETRIES = 5
-REQUEST_INTERVAL_SECONDS = 1.1
+PROFILE_RETRIES = 3
+PROFILE_REQUEST_INTERVAL_SECONDS = 1.5
 SAVE_EVERY = 50
-RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
-
-
-def _is_retryable_status(status: int) -> bool:
-    return status in RETRYABLE_STATUS_CODES or 500 <= status < 600
-
-
-def _request_json(
-    url: str,
-    params: Dict[str, str],
-    retries: int,
-    retry_wait_seconds: int,
-    log_non_200: bool = True,
-) -> Tuple[Optional[object], Optional[int]]:
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as e:
-            logger.warning(f"请求失败 (第 {attempt}/{retries} 次): {e}")
-            if attempt < retries:
-                time.sleep(retry_wait_seconds * attempt)
-            continue
-
-        status = response.status_code
-        if status == 200:
-            try:
-                return response.json(), status
-            except ValueError:
-                logger.warning(f"响应不是合法 JSON (第 {attempt}/{retries} 次)")
-                if attempt < retries:
-                    time.sleep(retry_wait_seconds * attempt)
-                continue
-
-        if _is_retryable_status(status):
-            if status == 429:
-                wait_seconds = max(retry_wait_seconds * attempt, 15)
-                logger.warning(f"触发 API 频率限制 (429)，等待 {wait_seconds} 秒后重试...")
-            else:
-                wait_seconds = retry_wait_seconds * attempt
-                logger.warning(f"HTTP {status} 为临时错误，等待 {wait_seconds} 秒后重试...")
-
-            if attempt < retries:
-                time.sleep(wait_seconds)
-                continue
-
-        if log_non_200:
-            logger.warning(f"HTTP {status}: {response.text[:200]}")
-        return None, status
-
-    return None, None
+EXCLUDED_NAME_PATTERNS = (
+    re.compile(r"\bwarrants?\b", re.IGNORECASE),
+    re.compile(r"\brights?\b", re.IGNORECASE),
+    re.compile(r"\bunits?\b", re.IGNORECASE),
+    re.compile(r"\bpreferred\b", re.IGNORECASE),
+    re.compile(r"\bdepositary\b", re.IGNORECASE),
+    re.compile(r"\bnotes?\b", re.IGNORECASE),
+    re.compile(r"\bbonds?\b", re.IGNORECASE),
+    re.compile(r"\bdebentures?\b", re.IGNORECASE),
+    re.compile(r"\betf\b", re.IGNORECASE),
+    re.compile(r"\betn\b", re.IGNORECASE),
+)
 
 
 def _load_json_dict(path: Path) -> Dict[str, dict]:
@@ -113,56 +79,115 @@ def _save_json(path: Path, data) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def get_finnhub_tickers(api_key: str) -> List[str]:
-    logger.info("从 Finnhub 获取全美股列表...")
-    payload, status = _request_json(
-        FILTER_CONFIG["API_URL"],
-        {"exchange": "US", "token": api_key},
-        retries=LIST_RETRIES,
-        retry_wait_seconds=5,
-        log_non_200=True,
-    )
-
-    if status != 200 or not isinstance(payload, list):
-        logger.error("无法获取股票列表，返回空结果。")
-        return []
-
-    # 基础过滤：仅保留普通股，排除 ETF 与其他 MIC
-    symbols = [
-        item["symbol"]
-        for item in payload
-        if isinstance(item, dict)
-        and item.get("type") == "Common Stock"
-        and item.get("mic") in FILTER_CONFIG["ALLOWED_MIC"]
-        and isinstance(item.get("symbol"), str)
-        and item.get("symbol")
-    ]
-    symbols = sorted(set(symbols))
-    logger.info(f"全市场普通股数量: {len(symbols)}")
-    return symbols
+def _normalize_symbol(symbol: str) -> str:
+    return symbol.strip().upper().replace(".", "-").replace("/", "-")
 
 
-def _get_company_profile(api_key: str, ticker: str) -> Optional[dict]:
-    payload, status = _request_json(
-        FILTER_CONFIG["PROFILE_URL"],
-        {"symbol": ticker, "token": api_key},
-        retries=PROFILE_RETRIES,
-        retry_wait_seconds=10,
-        log_non_200=False,
-    )
+def _wait_for_request_slot(next_request_time: float, interval_seconds: float) -> float:
+    now = time.monotonic()
+    if now < next_request_time:
+        time.sleep(next_request_time - now)
+    return time.monotonic() + interval_seconds
 
-    if status != 200 or not isinstance(payload, dict):
-        return None
-    if not payload:
-        return None
-    return payload
+
+def _looks_like_common_stock(security_name: str) -> bool:
+    if not security_name:
+        return False
+    return not any(pattern.search(security_name) for pattern in EXCLUDED_NAME_PATTERNS)
+
+
+def _request_text(url: str, retries: int) -> str:
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            logger.warning(f"下载 {url} 失败 (第 {attempt}/{retries} 次): {e}")
+            if attempt < retries:
+                time.sleep(5 * attempt)
+
+    raise RuntimeError(f"无法下载符号目录: {url}")
+
+
+def _parse_directory_rows(raw_text: str) -> List[Dict[str, str]]:
+    reader = csv.DictReader(io.StringIO(raw_text), delimiter="|")
+    rows: List[Dict[str, str]] = []
+    for row in reader:
+        if not row:
+            continue
+        if any("File Creation Time" in str(value) for value in row.values()):
+            continue
+        rows.append({str(key): str(value).strip() for key, value in row.items() if key})
+    return rows
+
+
+def get_yahoo_compatible_us_tickers() -> List[str]:
+    logger.info("从公开交易所目录获取美股代码...")
+
+    nasdaq_rows = _parse_directory_rows(_request_text(FILTER_CONFIG["NASDAQ_LISTED_URL"], LIST_RETRIES))
+    other_rows = _parse_directory_rows(_request_text(FILTER_CONFIG["OTHER_LISTED_URL"], LIST_RETRIES))
+
+    symbols = set()
+
+    for row in nasdaq_rows:
+        if row.get("Test Issue") != "N":
+            continue
+        if row.get("ETF") != "N":
+            continue
+        if row.get("NextShares") == "Y":
+            continue
+
+        symbol = _normalize_symbol(row.get("Symbol", ""))
+        security_name = row.get("Security Name", "")
+        if not symbol or not _looks_like_common_stock(security_name):
+            continue
+        symbols.add(symbol)
+
+    for row in other_rows:
+        if row.get("Test Issue") != "N":
+            continue
+        if row.get("ETF") != "N":
+            continue
+        if row.get("Exchange") not in FILTER_CONFIG["ALLOWED_OTHERLISTED_EXCHANGES"]:
+            continue
+
+        symbol = _normalize_symbol(row.get("NASDAQ Symbol") or row.get("CQS Symbol") or row.get("ACT Symbol", ""))
+        security_name = row.get("Security Name", "")
+        if not symbol or not _looks_like_common_stock(security_name):
+            continue
+        symbols.add(symbol)
+
+    sorted_symbols = sorted(symbols)
+    logger.info(f"交易所目录初筛后股票数: {len(sorted_symbols)}")
+    return sorted_symbols
+
+
+def _get_company_profile(ticker: str, next_request_time: float) -> Tuple[Optional[dict], float]:
+    for attempt in range(1, PROFILE_RETRIES + 1):
+        next_request_time = _wait_for_request_slot(
+            next_request_time,
+            PROFILE_REQUEST_INTERVAL_SECONDS,
+        )
+        try:
+            info = yf.Ticker(ticker).info
+        except Exception as e:
+            logger.warning(f"{ticker} 获取公司资料失败 (第 {attempt}/{PROFILE_RETRIES} 次): {e}")
+            if attempt < PROFILE_RETRIES:
+                time.sleep(3 * attempt)
+            continue
+
+        if isinstance(info, dict) and info:
+            return info, next_request_time
+
+        logger.warning(f"{ticker} 公司资料为空 (第 {attempt}/{PROFILE_RETRIES} 次)")
+        if attempt < PROFILE_RETRIES:
+            time.sleep(3 * attempt)
+
+    return None, next_request_time
 
 
 def main(output_path: Optional[str] = None):
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
-        raise ValueError("FINNHUB_API_KEY is required in .env")
-
     script_dir = Path(__file__).resolve().parent
     output_file = Path(output_path).resolve() if output_path else script_dir / "final_tickers.json"
     error_file = output_file.with_name("error_tickers.json")
@@ -170,7 +195,7 @@ def main(output_path: Optional[str] = None):
     staging_error_file = error_file.with_suffix(error_file.suffix + ".updating")
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    symbols = get_finnhub_tickers(api_key)
+    symbols = get_yahoo_compatible_us_tickers()
     if not symbols:
         logger.error("股票列表为空，停止更新。")
         return
@@ -178,8 +203,9 @@ def main(output_path: Optional[str] = None):
     previous_count = len(_load_json_dict(output_file))
     final_data: Dict[str, dict] = {}
     error_tickers = set()
+    next_profile_request_time = 0.0
     logger.info(
-        f"初步获取到 {len(symbols)} 只普通股，本次将全量重算（上次入选 {previous_count} 只）。"
+        f"初步获取到 {len(symbols)} 只股票，本次将全量重算（上次入选 {previous_count} 只）。"
     )
 
     excluded_sectors = {sector.lower() for sector in FILTER_CONFIG["EXCLUDED_SECTORS"]}
@@ -187,15 +213,27 @@ def main(output_path: Optional[str] = None):
 
     for count, ticker in enumerate(symbols, start=1):
         try:
-            data = _get_company_profile(api_key, ticker)
+            data, next_profile_request_time = _get_company_profile(
+                ticker,
+                next_profile_request_time,
+            )
             if not data:
                 error_tickers.add(ticker)
-                time.sleep(REQUEST_INTERVAL_SECONDS)
                 continue
 
-            market_cap = float(data.get("marketCapitalization") or 0) * 1_000_000
-            sector = str(data.get("finnhubIndustry") or "").strip()
+            quote_type = str(data.get("quoteType") or "").upper()
+            if quote_type and quote_type != "EQUITY":
+                continue
+
+            market_cap_raw = data.get("marketCap") or 0
+            sector = str(data.get("sector") or "").strip()
             sector_key = sector.lower().replace(" ", "-")
+
+            try:
+                market_cap = float(market_cap_raw)
+            except (TypeError, ValueError):
+                market_cap = 0.0
+
             error_tickers.discard(ticker)
 
             if market_cap >= threshold and sector.lower() not in excluded_sectors:
@@ -204,7 +242,7 @@ def main(output_path: Optional[str] = None):
                     "sector": sector,
                     "sectorKey": sector_key,
                 }
-                logger.info(f"[✓] {ticker} - {sector} - ${market_cap / 1e9:.2f}B")
+                logger.info(f"[✓] {ticker} - {sector or 'Unknown'} - ${market_cap / 1e9:.2f}B")
 
             if count % SAVE_EVERY == 0:
                 _save_json(staging_output_file, final_data)
@@ -212,8 +250,6 @@ def main(output_path: Optional[str] = None):
                 logger.info(
                     f"进度: {count}/{len(symbols)} - 已入选 {len(final_data)} 只 - 异常 {len(error_tickers)} 只"
                 )
-
-            time.sleep(REQUEST_INTERVAL_SECONDS)
         except Exception as e:
             logger.error(f"处理 {ticker} 时出错: {e}")
             error_tickers.add(ticker)

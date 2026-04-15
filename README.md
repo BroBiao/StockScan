@@ -9,7 +9,7 @@ This project is designed to run **once per day** (typically by cron or another s
 Each run of `scanner.py` does:
 
 1. Checks whether `final_tickers.json` is missing or outdated by month.
-2. If needed, refreshes the US stock universe via Finnhub (`us_ticker_filter.py`).
+2. If needed, refreshes the US stock universe via public exchange symbol directories + Yahoo Finance (`us_ticker_filter.py`).
 3. Scans tickers using daily price data from Yahoo Finance.
 4. Saves:
    - full results (`full_scan_result.json`)
@@ -45,7 +45,7 @@ Sector exclusions are applied from universe metadata.
 
 - Python 3.9+
 - Network access to:
-  - `finnhub.io` (universe + company profile)
+  - `nasdaqtrader.com` (US symbol directories)
   - `query1.finance.yahoo.com` (via `yfinance`)
   - Telegram Bot API (for notifications)
 
@@ -62,13 +62,11 @@ pip install -r requirements.txt
 Create a `.env` file in project root:
 
 ```bash
-FINNHUB_API_KEY=your_finnhub_key
 BOT_TOKEN=your_telegram_bot_token
 CHAT_ID=your_telegram_chat_id
 ```
 
 Notes:
-- `FINNHUB_API_KEY` is required for universe refresh.
 - `BOT_TOKEN` + `CHAT_ID` are required for sending messages.
 - If Telegram vars are missing, scan still runs and saves files, but skips notification.
 
@@ -103,17 +101,18 @@ Recommended:
 Current implementation includes:
 
 - Atomic JSON writes (tmp file + replace) to reduce file corruption risk.
-- Retry handling for temporary HTTP errors (including 429 and 5xx).
+- Retry handling for temporary download failures.
 - Full monthly universe recomputation (avoids stale carry-over symbols).
-- Fallback single-symbol fetch if a symbol is missing from batch price download.
+- Exchange-directory prefiltering for ETFs, test issues, NextShares, and obvious non-stock instruments before Yahoo enrichment.
+- Yahoo-compatible symbol normalization when reading the stock universe.
+- Fallback single-symbol fetch if a symbol is missing from a batch price download.
+- Request pacing for Yahoo Finance batch downloads and per-symbol metadata fetches to reduce throttling risk.
 
 ## Quick Troubleshooting
 
-- `ValueError: FINNHUB_API_KEY is required in .env`
-  - Add `FINNHUB_API_KEY` to `.env`.
+- 首次更新股票池较慢
+  - `us_ticker_filter.py` 需要逐只补充 Yahoo Finance 公司资料，属于预期行为。
 - No Telegram message sent
   - Verify `BOT_TOKEN`, `CHAT_ID`, and bot permissions in target chat.
-- Universe refresh is slow
-  - Expected with free-tier API rate limits.
 - Empty scan output
   - Check whether universe file is present and contains symbols, and verify market data connectivity.

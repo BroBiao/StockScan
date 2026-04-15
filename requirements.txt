@@ -1,4 +1,5 @@
 requests
 pandas
+yfinance
 python-telegram-bot
 python-dotenv
