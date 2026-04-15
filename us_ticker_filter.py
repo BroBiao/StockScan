@@ -15,14 +15,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 设置日志
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# 筛选配置
+# Filter configuration
 FILTER_CONFIG = {
     "MARKET_CAP_THRESHOLD": 1_000_000_000,  # 1B
-    "EXCLUDED_SECTORS": ["real-estate"],
+    "EXCLUDED_SECTORS": ["Real Estate"],
     "NASDAQ_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
     "OTHER_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
     "ALLOWED_OTHERLISTED_EXCHANGES": {"N", "A", "P"},
@@ -57,7 +57,7 @@ def _load_json_dict(path: Path) -> Dict[str, dict]:
         if isinstance(data, dict):
             return data
     except Exception as e:
-        logger.warning(f"读取 {path} 失败，将按空数据处理: {e}")
+        logger.warning("Failed to read %s; treating it as empty data: %s", path, e)
 
     return {}
 
@@ -83,6 +83,14 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace(".", "-").replace("/", "-")
 
 
+def _normalize_sector_name(sector: str) -> str:
+    return " ".join(sector.strip().lower().split())
+
+
+def _normalize_sector_key(sector: str) -> str:
+    return _normalize_sector_name(sector).replace(" ", "-")
+
+
 def _wait_for_request_slot(next_request_time: float, interval_seconds: float) -> float:
     now = time.monotonic()
     if now < next_request_time:
@@ -103,11 +111,11 @@ def _request_text(url: str, retries: int) -> str:
             response.raise_for_status()
             return response.text
         except requests.RequestException as e:
-            logger.warning(f"下载 {url} 失败 (第 {attempt}/{retries} 次): {e}")
+            logger.warning("Failed to download %s (attempt %s/%s): %s", url, attempt, retries, e)
             if attempt < retries:
                 time.sleep(5 * attempt)
 
-    raise RuntimeError(f"无法下载符号目录: {url}")
+    raise RuntimeError(f"Unable to download symbol directory: {url}")
 
 
 def _parse_directory_rows(raw_text: str) -> List[Dict[str, str]]:
@@ -123,7 +131,7 @@ def _parse_directory_rows(raw_text: str) -> List[Dict[str, str]]:
 
 
 def get_yahoo_compatible_us_tickers() -> List[str]:
-    logger.info("从公开交易所目录获取美股代码...")
+    logger.info("Fetching U.S. ticker symbols from public exchange directories...")
 
     nasdaq_rows = _parse_directory_rows(_request_text(FILTER_CONFIG["NASDAQ_LISTED_URL"], LIST_RETRIES))
     other_rows = _parse_directory_rows(_request_text(FILTER_CONFIG["OTHER_LISTED_URL"], LIST_RETRIES))
@@ -159,7 +167,7 @@ def get_yahoo_compatible_us_tickers() -> List[str]:
         symbols.add(symbol)
 
     sorted_symbols = sorted(symbols)
-    logger.info(f"交易所目录初筛后股票数: {len(sorted_symbols)}")
+    logger.info("Directory prefilter kept %s symbols.", len(sorted_symbols))
     return sorted_symbols
 
 
@@ -172,7 +180,13 @@ def _get_company_profile(ticker: str, next_request_time: float) -> Tuple[Optiona
         try:
             info = yf.Ticker(ticker).info
         except Exception as e:
-            logger.warning(f"{ticker} 获取公司资料失败 (第 {attempt}/{PROFILE_RETRIES} 次): {e}")
+            logger.warning(
+                "Failed to fetch company profile for %s (attempt %s/%s): %s",
+                ticker,
+                attempt,
+                PROFILE_RETRIES,
+                e,
+            )
             if attempt < PROFILE_RETRIES:
                 time.sleep(3 * attempt)
             continue
@@ -180,7 +194,12 @@ def _get_company_profile(ticker: str, next_request_time: float) -> Tuple[Optiona
         if isinstance(info, dict) and info:
             return info, next_request_time
 
-        logger.warning(f"{ticker} 公司资料为空 (第 {attempt}/{PROFILE_RETRIES} 次)")
+        logger.warning(
+            "Company profile for %s was empty (attempt %s/%s)",
+            ticker,
+            attempt,
+            PROFILE_RETRIES,
+        )
         if attempt < PROFILE_RETRIES:
             time.sleep(3 * attempt)
 
@@ -197,7 +216,7 @@ def main(output_path: Optional[str] = None):
 
     symbols = get_yahoo_compatible_us_tickers()
     if not symbols:
-        logger.error("股票列表为空，停止更新。")
+        logger.error("Ticker list is empty. Stopping refresh.")
         return
 
     previous_count = len(_load_json_dict(output_file))
@@ -205,10 +224,17 @@ def main(output_path: Optional[str] = None):
     error_tickers = set()
     next_profile_request_time = 0.0
     logger.info(
-        f"初步获取到 {len(symbols)} 只股票，本次将全量重算（上次入选 {previous_count} 只）。"
+        "Loaded %s candidate symbols. Rebuilding the entire universe from scratch (previous universe size: %s).",
+        len(symbols),
+        previous_count,
     )
 
-    excluded_sectors = {sector.lower() for sector in FILTER_CONFIG["EXCLUDED_SECTORS"]}
+    excluded_sector_names = {
+        _normalize_sector_name(sector) for sector in FILTER_CONFIG["EXCLUDED_SECTORS"]
+    }
+    excluded_sector_keys = {
+        _normalize_sector_key(sector) for sector in FILTER_CONFIG["EXCLUDED_SECTORS"]
+    }
     threshold = FILTER_CONFIG["MARKET_CAP_THRESHOLD"]
 
     for count, ticker in enumerate(symbols, start=1):
@@ -227,7 +253,8 @@ def main(output_path: Optional[str] = None):
 
             market_cap_raw = data.get("marketCap") or 0
             sector = str(data.get("sector") or "").strip()
-            sector_key = sector.lower().replace(" ", "-")
+            sector_key = _normalize_sector_key(sector)
+            sector_name = _normalize_sector_name(sector)
 
             try:
                 market_cap = float(market_cap_raw)
@@ -236,7 +263,7 @@ def main(output_path: Optional[str] = None):
 
             error_tickers.discard(ticker)
 
-            if market_cap >= threshold and sector.lower() not in excluded_sectors:
+            if market_cap >= threshold and sector_name not in excluded_sector_names and sector_key not in excluded_sector_keys:
                 final_data[ticker] = {
                     "marketCap": market_cap,
                     "sector": sector,
@@ -248,10 +275,14 @@ def main(output_path: Optional[str] = None):
                 _save_json(staging_output_file, final_data)
                 _save_json(staging_error_file, sorted(error_tickers))
                 logger.info(
-                    f"进度: {count}/{len(symbols)} - 已入选 {len(final_data)} 只 - 异常 {len(error_tickers)} 只"
+                    "Progress: %s/%s processed, %s selected, %s errors",
+                    count,
+                    len(symbols),
+                    len(final_data),
+                    len(error_tickers),
                 )
         except Exception as e:
-            logger.error(f"处理 {ticker} 时出错: {e}")
+            logger.error("Failed to process %s: %s", ticker, e)
             error_tickers.add(ticker)
             time.sleep(2)
 
@@ -259,7 +290,11 @@ def main(output_path: Optional[str] = None):
     _save_json(staging_error_file, sorted(error_tickers))
     os.replace(staging_output_file, output_file)
     os.replace(staging_error_file, error_file)
-    logger.info(f"股票池更新完成，共 {len(final_data)} 只股票，异常 {len(error_tickers)} 只。")
+    logger.info(
+        "Universe refresh completed. Selected %s symbols with %s errors.",
+        len(final_data),
+        len(error_tickers),
+    )
 
 
 if __name__ == "__main__":

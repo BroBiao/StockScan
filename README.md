@@ -34,7 +34,7 @@ Sector exclusions are applied from universe metadata.
 ## Repository Files
 
 - `scanner.py`: daily runner, signal scan, output persistence, Telegram sender
-- `us_ticker_filter.py`: monthly universe builder from Finnhub
+- `us_ticker_filter.py`: monthly universe builder from public exchange symbol directories and Yahoo Finance
 - `requirements.txt`: Python dependencies
 - `final_tickers.json`: filtered stock universe (ticker -> metadata)
 - `error_tickers.json`: tickers that failed during universe refresh
@@ -110,8 +110,8 @@ Current implementation includes:
 
 ## Quick Troubleshooting
 
-- 首次更新股票池较慢
-  - `us_ticker_filter.py` 需要逐只补充 Yahoo Finance 公司资料，属于预期行为。
+- First universe refresh is slow
+  - `us_ticker_filter.py` enriches symbols one by one from Yahoo Finance and intentionally throttles requests, so the initial build can take a long time.
 - No Telegram message sent
   - Verify `BOT_TOKEN`, `CHAT_ID`, and bot permissions in target chat.
 - Empty scan output
