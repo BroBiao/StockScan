@@ -29,7 +29,7 @@ DOWNLOAD_REQUEST_INTERVAL_SECONDS = 2.0
 
 # Strategy configuration
 SCAN_CONFIG = {
-    "EXCLUDED_SECTORS": ["Real Estate"],
+    "EXCLUDED_SECTORS": ["Financial Services"],
     "MARKET_DATA": {
         "LOOKBACK_PERIOD": "18mo",
         "BATCH_SIZE": 100,

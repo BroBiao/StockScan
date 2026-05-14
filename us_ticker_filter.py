@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Filter configuration
 FILTER_CONFIG = {
     "MARKET_CAP_THRESHOLD": 1_000_000_000,  # 1B
-    "EXCLUDED_SECTORS": ["Real Estate"],
+    "EXCLUDED_SECTORS": ["Financial Services"],
     "NASDAQ_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
     "OTHER_LISTED_URL": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
     "ALLOWED_OTHERLISTED_EXCHANGES": {"N", "A", "P"},
